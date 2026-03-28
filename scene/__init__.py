@@ -81,9 +81,9 @@ class Scene:
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args)
 
             pseudo_cams = []
-            if args.source_path.find('llff'):
+            if 'llff' in args.source_path or '360' not in args.source_path:
                 pseudo_poses = generate_random_poses_llff(self.train_cameras[resolution_scale])
-            elif args.source_path.find('360'):
+            else:
                 pseudo_poses = generate_random_poses_360(self.train_cameras[resolution_scale])
             view = self.train_cameras[resolution_scale][0]
             for pose in pseudo_poses:

@@ -43,8 +43,9 @@ class CameraInfo(NamedTuple):
     image_name: str
     width: int
     height: int
-    mask: np.array
-    bounds: np.array
+    mask: np.array = None
+    bounds: np.array = None
+    depth_image: np.array = None
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -52,6 +53,7 @@ class SceneInfo(NamedTuple):
     test_cameras: list
     nerf_normalization: dict
     ply_path: str
+    pseudo_cameras: list = None
 
 def getNerfppNorm(cam_info):
     def get_center_and_diag(cam_centers):
@@ -320,18 +322,21 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
     with open(os.path.join(path, transformsfile)) as json_file:
         contents = json.load(json_file)
         fovx = contents["camera_angle_x"]
+        cam_convention = contents.get("cam_convention", "opengl")
 
-        skip = 8 if transformsfile == 'transforms_test.json' else 1
-        frames = contents["frames"][::skip]
+        frames = contents["frames"]
         for idx, frame in tqdm(enumerate(frames)):
             cam_name = os.path.join(path, frame["file_path"] + extension)
 
-            # NeRF 'transform_matrix' is a camera-to-world transform
             c2w = np.array(frame["transform_matrix"])
-            # change from OpenGL/Blender camera axes (Y up, Z back) to COLMAP (Y down, Z forward)
-            c2w[:3, 1:3] *= -1
 
-            # get the world-to-camera transform and set R, T
+            if cam_convention == "opengl":
+                c2w[:3, 1:3] *= -1
+            elif cam_convention == "z_back":
+                c2w[:3, 0] *= -1
+                c2w[:3, 2] *= -1
+            # opencv: no conversion needed
+
             w2c = np.linalg.inv(c2w)
             R = np.transpose(w2c[:3,:3])  # R is stored transposed due to 'glm' in CUDA code
             T = w2c[:3, 3]
@@ -353,21 +358,10 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             FovX = fovx
 
             mask = norm_data[:, :, 3:4]
-            if skip == 1:
-                depth_image = np.load('../SparseNeRF/depth_midas_temp_DPT_Hybrid/Blender/' +
-                                      image_path.split('/')[-4]+'/'+image_name+'_depth.npy')
-            else:
-                depth_image = None
-
-            arr = cv2.resize(arr, (400, 400))
-            image = Image.fromarray(np.array(arr * 255.0, dtype=np.byte), "RGB")
-            depth_image = None if depth_image is None else cv2.resize(depth_image, (400, 400))
-            mask = None if mask is None else cv2.resize(mask, (400, 400))
-
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image, image_path=image_path,
                                         image_name=image_name, width=image.size[0], height=image.size[1],
-                                        depth_image=depth_image, mask=mask))
+                                        depth_image=None, mask=mask))
     return cam_infos
 
 
@@ -382,7 +376,7 @@ def readNerfSyntheticInfo(path, white_background, eval, n_views=0, extension=".p
         train_cam_infos.extend(test_cam_infos)
         test_cam_infos = []
 
-    pseudo_cam_infos = train_cam_infos #train_cam_infos
+    pseudo_cam_infos = train_cam_infos
     if n_views > 0:
         train_cam_infos = train_cam_infos[:n_views]
         assert len(train_cam_infos) == n_views
@@ -390,23 +384,33 @@ def readNerfSyntheticInfo(path, white_background, eval, n_views=0, extension=".p
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
     ply_path = os.path.join(path, str(n_views) + "_views/dense/fused.ply")
+    if not os.path.exists(ply_path):
+        fallback = os.path.join(path, "points3d.ply")
+        if os.path.exists(fallback):
+            ply_path = fallback
+            print(f"Using fallback point cloud: {ply_path}")
+        else:
+            num_pts = 10_000
+            print(f"No point cloud found, generating random ({num_pts} pts)...")
+            cam_positions = []
+            for cam in train_cam_infos:
+                W2C = np.eye(4)
+                W2C[:3, :3] = cam.R.T
+                W2C[:3, 3] = cam.T
+                C2W = np.linalg.inv(W2C)
+                cam_positions.append(C2W[:3, 3])
+            cam_positions = np.array(cam_positions)
+            center = cam_positions.mean(0)
+            extent = np.abs(cam_positions - center).max() * 1.5
+            xyz = (np.random.random((num_pts, 3)) * 2 - 1) * extent + center
+            shs = np.random.random((num_pts, 3)) / 255.0
+            os.makedirs(os.path.dirname(ply_path), exist_ok=True)
+            storePly(ply_path, xyz, SH2RGB(shs) * 255)
 
-    # if not os.path.exists(ply_path):
-    #     # Since this data set has no colmap data, we start with random points
-    #     num_pts = 30000
-    #     print(f"Generating random point cloud ({num_pts})...")
-    #
-    #     # We create random points inside the bounds of the synthetic Blender scenes
-    #     xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
-    #     shs = np.random.random((num_pts, 3)) / 255.0
-    #     pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
-    #
-    #     storePly(ply_path, xyz, SH2RGB(shs) * 255)
     try:
         pcd = fetchPly(ply_path)
     except:
         pcd = None
-
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
